@@ -28,25 +28,38 @@ func New(w io.Writer) *Alog {
 	if w == nil {
 		w = os.Stdout
 	}
+	m := &sync.Mutex{}
 	msgCh := make(chan string)
 	errorCh := make(chan error)
-	m := &sync.Mutex{}
+	shutdownCh := make(chan struct{})
+	shutdownCompleteCh := make(chan struct{})
 	return &Alog{
-		dest:    w,
-		msgCh:   msgCh,
-		errorCh: errorCh,
-		m:       m,
+		dest:               w,
+		m:                  m,
+		msgCh:              msgCh,
+		errorCh:            errorCh,
+		shutdownCh:         shutdownCh,
+		shutdownCompleteCh: shutdownCompleteCh,
 	}
 }
 
 // Start begins the message loop for the asynchronous logger. It should be initiated as a goroutine to prevent
 // the caller from being blocked.
 func (al Alog) Start() {
+	wg := &sync.WaitGroup{}
+MAIN_LOOP:
 	for {
-		msg := <-al.msgCh
-		go func() {
-			al.write(msg, nil)
-		}()
+		select {
+		case msg := <-al.msgCh:
+			wg.Add(1)
+			go func() {
+				al.write(msg, wg)
+			}()
+		case <-al.shutdownCh:
+			wg.Wait()
+			al.shutdown()
+			break MAIN_LOOP
+		}
 	}
 }
 
@@ -60,12 +73,7 @@ func (al Alog) formatMessage(msg string) string {
 func (al Alog) write(msg string, wg *sync.WaitGroup) {
 	al.m.Lock()
 	defer al.m.Unlock()
-	// defer wg.Done()
-	// defer func() {
-	// 	if wg != nil {
-	// 		wg.Done()
-	// 	}
-	// }()
+	defer wg.Done()
 	_, err := al.dest.Write([]byte(al.formatMessage(msg)))
 	if err != nil {
 		go func() { al.errorCh <- err }()
@@ -73,6 +81,8 @@ func (al Alog) write(msg string, wg *sync.WaitGroup) {
 }
 
 func (al Alog) shutdown() {
+	close(al.msgCh)
+	al.shutdownCompleteCh <- struct{}{}
 }
 
 // MessageChannel returns a channel that accepts messages that should be written to the log.
@@ -92,6 +102,8 @@ func (al Alog) ErrorChannel() <-chan error {
 // Stop shuts down the logger. It will wait for all pending messages to be written and then return.
 // The logger will no longer function after this method has been called.
 func (al Alog) Stop() {
+	al.shutdownCh <- struct{}{}
+	<-al.shutdownCompleteCh
 }
 
 // Write synchronously sends the message to the log output
